@@ -1,0 +1,1331 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>DOOM Clone — Raycasting Engine</title>
+<style>
+/* ================================================================
+   ESTILO: tela cheia, pixel art, cursor oculto
+   O canvas interno é 320x200 (resolução do DOOM original),
+   escalado para preencher a janela com pixels nítidos.
+   ================================================================ */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    background: #000;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100vw;
+    height: 100vh;
+}
+canvas {
+    display: block;
+    /* image-rendering pixelated garante upscale sem antialiasing */
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    -ms-interpolation-mode: nearest-neighbor;
+}
+
+</style>
+</head>
+<body>
+
+<canvas id="game"></canvas>
+
+
+
+<script>
+// ================================================================
+//  ██████   ██████   ██████  ███    ███      ██████ ██       ██████  ███    ██ ███████
+//  ██   ██ ██    ██ ██    ██ ████  ████     ██      ██      ██    ██ ████   ██ ██
+//  ██   ██ ██    ██ ██    ██ ██ ████ ██     ██      ██      ██    ██ ██ ██  ██ █████
+//  ██   ██ ██    ██ ██    ██ ██  ██  ██     ██      ██      ██    ██ ██  ██ ██ ██
+//  ██████   ██████   ██████  ██      ██      ██████ ███████  ██████  ██   ████ ███████
+//
+//  Motor de Raycasting completo em JavaScript puro
+//  Técnica: DDA (Digital Differential Analysis) — como Wolfenstein 3D / DOOM
+//  Resolução interna: 320×200 (idêntica ao DOOM de 1993)
+//  Sem bibliotecas externas — apenas Canvas 2D API + Web Audio API
+// ================================================================
+
+'use strict';
+
+// ================================================================
+//  SEÇÃO 1: CONFIGURAÇÃO GLOBAL E CONSTANTES
+//  Todas as constantes do motor ficam centralizadas aqui para
+//  facilitar ajuste e experimentação.
+// ================================================================
+
+const canvas  = document.getElementById('game');
+const ctx     = canvas.getContext('2d');
+
+// --- Resolução interna do raycaster (320×200 como o DOOM original) ---
+const SCREEN_W = 320;
+const SCREEN_H = 200;
+canvas.width  = SCREEN_W;
+canvas.height = SCREEN_H;
+
+// Escalar canvas para preencher a janela mantendo aspect ratio
+function resizeCanvas() {
+    const aspect = SCREEN_W / SCREEN_H;
+    let w = window.innerWidth;
+    let h = window.innerHeight;
+    if (w / h > aspect) { w = h * aspect; }
+    else                { h = w / aspect; }
+    canvas.style.width  = Math.floor(w) + 'px';
+    canvas.style.height = Math.floor(h) + 'px';
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+// --- Tamanho das texturas (potência de 2 para masking rápido) ---
+const TEX_SIZE = 64;
+
+// --- Campo de visão ---
+// O plano da câmera tem magnitude ≈ tan(FOV/2)
+// Para FOV ≈ 66°: tan(33°) ≈ 0.66
+const PLANE_LENGTH = 0.66;
+
+// --- Velocidades ---
+const MOVE_SPEED       = 3.0;   // unidades/segundo
+const MOUSE_SENSITIVITY = 0.003; // radianos/pixel
+const COLLISION_RADIUS = 0.25;   // raio do jogador para colisão
+
+// ================================================================
+//  SEÇÃO 2: DEFINIÇÃO DO MAPA
+//
+//  O mapa é uma grade 2D de inteiros:
+//    0 = espaço vazio (passável)
+//    1 = Tijolos vermelhos
+//    2 = Pedra cinza
+//    3 = Painéis metálicos (azul)
+//    4 = Madeira
+//
+//  O raycaster usa worldMap[y][x] (linha, coluna).
+//  O jogador se move em coordenadas contínuas (float) dentro desta grade.
+// ================================================================
+
+const MAP_W = 24;
+const MAP_H = 24;
+
+// Mapa: complexo industrial/base demoníaca com múltiplas salas e corredores
+const worldMap = [
+//   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1], // 0
+    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1], // 1
+    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1], // 2
+    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1], // 3
+    [1,0,0,0,2,2,2,2,0,0,0,0,0,0,0,0,3,3,3,3,0,0,0,1], // 4  salas superiores
+    [1,0,0,0,2,0,0,2,0,0,0,0,0,0,0,0,3,0,0,3,0,0,0,1], // 5
+    [1,0,0,0,2,0,0,2,0,0,0,0,0,0,0,0,3,0,0,3,0,0,0,1], // 6
+    [1,0,0,0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,0,0,0,1], // 7  aberturas nas salas
+    [1,0,0,0,2,2,2,2,0,0,0,0,0,0,0,0,3,3,3,3,0,0,0,1], // 8
+    [1,0,0,0,0,0,0,0,0,0,0,4,4,0,0,0,0,0,0,0,0,0,0,1], // 9
+    [1,0,0,0,0,0,0,0,0,0,0,4,4,0,0,0,0,0,0,0,0,0,0,1], // 10 pilares centrais
+    [1,0,0,0,0,0,0,0,0,4,4,4,0,4,4,0,0,0,0,0,0,0,0,1], // 11 sala central
+    [1,0,0,0,0,0,0,0,0,4,0,0,0,0,4,0,0,0,0,0,0,0,0,1], // 12
+    [1,0,0,0,0,0,0,0,0,4,0,0,0,0,4,0,0,0,0,0,0,0,0,1], // 13
+    [1,0,0,0,0,0,0,0,0,4,0,0,0,0,4,0,0,0,0,0,0,0,0,1], // 14
+    [1,0,0,0,0,0,0,0,0,0,0,0,4,4,4,0,0,0,0,0,0,0,0,1], // 15 saída inferior da sala
+    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1], // 16
+    [1,0,0,0,3,3,3,3,0,0,0,0,0,0,0,0,2,2,2,2,0,0,0,1], // 17 salas inferiores
+    [1,0,0,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,1], // 18 aberturas
+    [1,0,0,0,3,0,0,3,0,0,0,0,0,0,0,0,2,0,0,2,0,0,0,1], // 19
+    [1,0,0,0,3,0,0,3,0,0,0,0,0,0,0,0,2,0,0,2,0,0,0,1], // 20
+    [1,0,0,0,3,3,3,3,0,0,0,0,0,0,0,0,2,2,2,2,0,0,0,1], // 21
+    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1], // 22
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1], // 23
+];
+
+// Posições de spawn dos inimigos (x, y em coordenadas do mapa)
+const ENEMY_SPAWNS = [
+    // Sala superior esquerda (pedra)
+    { x: 5.5,  y: 5.5 },
+    { x: 6.5,  y: 6.5 },
+    // Sala superior direita (metal)
+    { x: 17.5, y: 5.5 },
+    { x: 18.5, y: 6.5 },
+    // Sala central (madeira)
+    { x: 11.5, y: 12.5 },
+    { x: 12.5, y: 13.5 },
+    // Sala inferior esquerda (metal)
+    { x: 5.5,  y: 19.5 },
+    // Sala inferior direita (pedra)
+    { x: 17.5, y: 19.5 },
+    { x: 18.5, y: 20.5 },
+    // Corredores
+    { x: 10.5, y: 3.5 },
+    { x: 14.5, y: 22.0 },
+    { x: 2.5,  y: 11.5 },
+];
+
+// ================================================================
+//  SEÇÃO 3: GERAÇÃO PROCEDURAL DE TEXTURAS
+//
+//  Cada textura é um Uint32Array de TEX_SIZE × TEX_SIZE pixels.
+//  Cada pixel é stored como 0xRRGGBB (24-bit color).
+//  Texturas são geradas uma vez na inicialização para evitar
+//  cálculos repetidos em runtime.
+// ================================================================
+
+const textures = []; // textures[index][y * TEX_SIZE + x]
+
+function generateTextures() {
+    // --- Textura 0: Tijolos vermelhos ---
+    // Padrão de tijolos alternados com argamassa cinza
+    const tex0 = new Uint32Array(TEX_SIZE * TEX_SIZE);
+    for (let y = 0; y < TEX_SIZE; y++) {
+        for (let x = 0; x < TEX_SIZE; x++) {
+            const brickH = 16, brickW = 32;
+            const row = Math.floor(y / brickH);
+            const offset = (row & 1) * (brickW >> 1); // Offset alternado
+            const bx = (x + offset) % brickW;
+            const by = y % brickH;
+            if (by === 0 || bx === 0) {
+                // Argamassa entre tijolos
+                tex0[y * TEX_SIZE + x] = 0x808080;
+            } else {
+                // Tijolo com variação pseudoaleatória de cor
+                const v = ((x * 31 + y * 17) & 31) - 16;
+                const r = Math.max(0, Math.min(255, 155 + v));
+                const g = Math.max(0, Math.min(255, 48 + (v >> 1)));
+                const b = Math.max(0, Math.min(255, 38 + (v >> 1)));
+                tex0[y * TEX_SIZE + x] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+    textures.push(tex0);
+
+    // --- Textura 1: Pedra cinza ---
+    // Blocos de pedra cortada com ruído e arestas escuras
+    const tex1 = new Uint32Array(TEX_SIZE * TEX_SIZE);
+    for (let y = 0; y < TEX_SIZE; y++) {
+        for (let x = 0; x < TEX_SIZE; x++) {
+            const noise = ((x * 73 + y * 41 + x * y * 3) % 40) - 20;
+            const edge = (x % 16 === 0 || y % 16 === 0) ? -30 : 0;
+            const base = Math.max(0, Math.min(255, 128 + noise + edge));
+            tex1[y * TEX_SIZE + x] = (base << 16) | (base << 8) | base;
+        }
+    }
+    textures.push(tex1);
+
+    // --- Textura 2: Painéis metálicos azul-cinza ---
+    // Painéis industriais com rebites nos cantos
+    const tex2 = new Uint32Array(TEX_SIZE * TEX_SIZE);
+    for (let y = 0; y < TEX_SIZE; y++) {
+        for (let x = 0; x < TEX_SIZE; x++) {
+            const noise = ((x * 57 + y * 23) % 20) - 10;
+            const panel = (y % 32 < 2 || x % 32 < 2) ? -40 : 0;
+            const px = x % 32, py = y % 32;
+            const rivet = ((px < 4 || px > 28) && (py < 4 || py > 28)) ? 30 : 0;
+            const r = Math.max(0, Math.min(255, 80 + noise + panel + rivet));
+            const g = Math.max(0, Math.min(255, 90 + noise + panel + rivet));
+            const b = Math.max(0, Math.min(255, 140 + noise + panel + rivet));
+            tex2[y * TEX_SIZE + x] = (r << 16) | (g << 8) | b;
+        }
+    }
+    textures.push(tex2);
+
+    // --- Textura 3: Madeira ---
+    // Tábuas verticais com veios sinusoidais
+    const tex3 = new Uint32Array(TEX_SIZE * TEX_SIZE);
+    for (let y = 0; y < TEX_SIZE; y++) {
+        for (let x = 0; x < TEX_SIZE; x++) {
+            const grain = Math.sin(y * 0.3 + Math.sin(x * 0.1) * 3) * 15;
+            const noise = ((x * 37 + y * 53) % 15) - 7;
+            const plank = (x % 16 === 0) ? -30 : 0;
+            const r = Math.max(0, Math.min(255, 140 + grain + noise + plank));
+            const g = Math.max(0, Math.min(255, 90 + grain + noise + plank));
+            const b = Math.max(0, Math.min(255, 40 + grain * 0.5 + noise + plank));
+            tex3[y * TEX_SIZE + x] = (r << 16) | (g << 8) | b;
+        }
+    }
+    textures.push(tex3);
+}
+
+// ================================================================
+//  SEÇÃO 4: GERAÇÃO DE SPRITES DE INIMIGOS
+//
+//  Sprites 64×64 desenhados proceduralmente (pixel art).
+//  Armazenados como Uint32Array: 0 = transparente, senão 0xRRGGBB.
+//  Três variantes: vivo, flash de dano, morto.
+// ================================================================
+
+const SPRITE_SIZE = 64;
+let spriteAlive = null; // sprite do inimigo vivo
+let spriteHurt  = null; // sprite com flash de dano
+let spriteDead  = null; // sprite do inimigo morto (caído)
+
+function generateEnemySprites() {
+    spriteAlive = new Uint32Array(SPRITE_SIZE * SPRITE_SIZE); // inicia em 0 (transparente)
+
+    // Funções auxiliares de desenho no array de pixels
+    const set = (arr, x, y, c) => {
+        if (x >= 0 && x < SPRITE_SIZE && y >= 0 && y < SPRITE_SIZE)
+            arr[y * SPRITE_SIZE + x] = c;
+    };
+    const fillCirc = (arr, cx, cy, r, c) => {
+        const r2 = r * r;
+        for (let dy = -r; dy <= r; dy++)
+            for (let dx = -r; dx <= r; dx++)
+                if (dx * dx + dy * dy <= r2) set(arr, cx + dx, cy + dy, c);
+    };
+    const fillRect = (arr, x, y, w, h, c) => {
+        for (let dy = 0; dy < h; dy++)
+            for (let dx = 0; dx < w; dx++)
+                set(arr, x + dx, y + dy, c);
+    };
+
+    const BODY  = 0xCC2222; // vermelho escuro
+    const DARK  = 0x881111; // sombra
+    const VDARK = 0x660000; // muito escuro
+    const EYE   = 0xFFFF00; // amarelo
+    const FANG  = 0xFFFFFF; // branco
+
+    // Corpo (torso + pernas)
+    fillCirc(spriteAlive, 32, 34, 13, BODY);
+    fillRect(spriteAlive, 20, 34, 24, 18, BODY);
+
+    // Cabeça
+    fillCirc(spriteAlive, 32, 18, 10, BODY);
+
+    // Chifres
+    fillRect(spriteAlive, 22, 6, 3, 12, DARK);
+    fillRect(spriteAlive, 39, 6, 3, 12, DARK);
+    fillRect(spriteAlive, 20, 4, 6, 3, DARK);
+    fillRect(spriteAlive, 38, 4, 6, 3, DARK);
+
+    // Olhos
+    fillCirc(spriteAlive, 27, 17, 3, EYE);
+    fillCirc(spriteAlive, 37, 17, 3, EYE);
+    fillCirc(spriteAlive, 28, 17, 1, 0xFF0000);
+    fillCirc(spriteAlive, 38, 17, 1, 0xFF0000);
+
+    // Boca / presas
+    fillRect(spriteAlive, 27, 24, 10, 2, VDARK);
+    set(spriteAlive, 29, 23, FANG); set(spriteAlive, 35, 23, FANG);
+    set(spriteAlive, 29, 26, FANG); set(spriteAlive, 35, 26, FANG);
+
+    // Braços
+    fillRect(spriteAlive, 14, 30, 6, 16, BODY);
+    fillRect(spriteAlive, 44, 30, 6, 16, BODY);
+    // Garras
+    fillRect(spriteAlive, 13, 44, 3, 5, DARK);
+    fillRect(spriteAlive, 17, 44, 3, 5, DARK);
+    fillRect(spriteAlive, 44, 44, 3, 5, DARK);
+    fillRect(spriteAlive, 48, 44, 3, 5, DARK);
+
+    // Pernas
+    fillRect(spriteAlive, 24, 50, 6, 12, VDARK);
+    fillRect(spriteAlive, 34, 50, 6, 12, VDARK);
+    // Pés
+    fillRect(spriteAlive, 22, 60, 10, 3, VDARK);
+    fillRect(spriteAlive, 32, 60, 10, 3, VDARK);
+
+    // --- Sprite de dano (flash branco) ---
+    spriteHurt = new Uint32Array(SPRITE_SIZE * SPRITE_SIZE);
+    for (let i = 0; i < spriteAlive.length; i++) {
+        if (spriteAlive[i] !== 0) {
+            const r = Math.min(255, ((spriteAlive[i] >> 16) & 0xFF) + 120);
+            const g = Math.min(255, ((spriteAlive[i] >> 8) & 0xFF) + 120);
+            const b = Math.min(255, (spriteAlive[i] & 0xFF) + 120);
+            spriteHurt[i] = (r << 16) | (g << 8) | b;
+        }
+    }
+
+    // --- Sprite morto (corpo caído no chão) ---
+    spriteDead = new Uint32Array(SPRITE_SIZE * SPRITE_SIZE);
+    const DC = 0x661111;
+    fillRect(spriteDead, 14, 50, 36, 8, DC);
+    fillCirc(spriteDead, 32, 52, 14, DC);
+    fillRect(spriteDead, 18, 46, 28, 4, 0x440000);
+    // Olhos em X
+    set(spriteDead, 26, 50, 0x333333); set(spriteDead, 28, 52, 0x333333);
+    set(spriteDead, 36, 50, 0x333333); set(spriteDead, 38, 52, 0x333333);
+}
+
+// ================================================================
+//  SEÇÃO 5: ESTADO DO JOGADOR
+// ================================================================
+
+const player = {
+    x: 2.0,  y: 2.0,           // Posição no mapa (float)
+    dirX: 1.0, dirY: 0.0,      // Vetor de direção (unitário)
+    planeX: 0.0, planeY: PLANE_LENGTH, // Plano da câmera (⊥ dir)
+    hp: 100, maxHp: 100,
+    alive: true,
+    hurtTimer: 0,               // Timer de flash de dano (segundos)
+    kills: 0,
+};
+
+// ================================================================
+//  SEÇÃO 6: SISTEMA DE INIMIGOS
+//
+//  Cada inimigo tem:
+//  - Posição (x, y)
+//  - HP e sistema de dano
+//  - IA com estados: idle → chase → attack → dead
+//  - Timers para cooldowns e animações
+// ================================================================
+
+let enemies = [];
+
+function spawnEnemies() {
+    enemies = [];
+    for (const spawn of ENEMY_SPAWNS) {
+        enemies.push({
+            x: spawn.x, y: spawn.y,
+            hp: 40, maxHp: 40,
+            alive: true,
+            speed: 1.0 + Math.random() * 0.8,     // Variação de velocidade
+            damage: 8 + Math.floor(Math.random() * 7), // 8-14 de dano
+            attackRange: 1.5,
+            attackCooldown: 0,
+            attackInterval: 1.0 + Math.random() * 0.5,
+            detectionRange: 10.0,
+            hurtTimer: 0,
+            deathTimer: 0,
+            state: 'idle', // idle | chase | attack | dead
+        });
+    }
+}
+
+// ================================================================
+//  SEÇÃO 7: SISTEMA DE ARMA
+// ================================================================
+
+const weapon = {
+    damage: 25,
+    cooldown: 0,
+    fireRate: 0.35,            // Segundos entre tiros
+    firing: false,
+    fireTimer: 0,
+    fireAnimDuration: 0.12,
+};
+
+// ================================================================
+//  SEÇÃO 8: SISTEMA DE ENTRADA (Teclado + Mouse)
+//
+//  Usa Pointer Lock API para captura do mouse em tela cheia.
+//  Teclas armazenadas em um map para polling no game loop.
+// ================================================================
+
+const keys = {};
+let mouseMovementX = 0;
+let pointerLocked  = false;
+
+document.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (e.code === 'KeyR' && !player.alive) restartGame();
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+document.addEventListener('mousemove', e => {
+    if (pointerLocked) mouseMovementX += e.movementX;
+});
+
+canvas.addEventListener('click', () => {
+    if (!pointerLocked) {
+        canvas.requestPointerLock();
+    } else if (player.alive) {
+        fireWeapon();
+    }
+});
+
+// Ativar pointer lock automaticamente ao mover o mouse sobre o canvas
+canvas.addEventListener('mouseenter', () => {
+    if (!pointerLocked) canvas.requestPointerLock();
+});
+
+document.addEventListener('mousedown', e => {
+    if (pointerLocked && e.button === 0 && player.alive) fireWeapon();
+});
+
+document.addEventListener('pointerlockchange', () => {
+    pointerLocked = (document.pointerLockElement === canvas);
+});
+
+// ================================================================
+//  SEÇÃO 9: SISTEMA DE ÁUDIO (Web Audio API)
+//
+//  Sons sintéticos gerados em tempo real com osciladores e ruído.
+//  Nenhum arquivo externo necessário.
+// ================================================================
+
+let audioCtx = null;
+
+function ensureAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+// Tiro: burst de ruído branco com decay exponencial
+function playGunshot() {
+    ensureAudio();
+    const dur = 0.1;
+    const len = audioCtx.sampleRate * dur;
+    const buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) {
+        d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (len * 0.15));
+    }
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    const g = audioCtx.createGain();
+    g.gain.value = 0.3;
+    src.connect(g); g.connect(audioCtx.destination);
+    src.start();
+}
+
+// Hit: tom agudo descendente
+function playHit() {
+    ensureAudio();
+    const osc = audioCtx.createOscillator();
+    const g   = audioCtx.createGain();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(200, audioCtx.currentTime + 0.1);
+    g.gain.setValueAtTime(0.15, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+    osc.connect(g); g.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + 0.12);
+}
+
+// Morte: tom grave descendente longo
+function playDeath() {
+    ensureAudio();
+    const osc = audioCtx.createOscillator();
+    const g   = audioCtx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(40, audioCtx.currentTime + 0.5);
+    g.gain.setValueAtTime(0.12, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+    osc.connect(g); g.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + 0.55);
+}
+
+// Dano no jogador: tom grave
+function playPlayerHurt() {
+    ensureAudio();
+    const osc = audioCtx.createOscillator();
+    const g   = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(60, audioCtx.currentTime + 0.25);
+    g.gain.setValueAtTime(0.25, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.25);
+    osc.connect(g); g.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + 0.3);
+}
+
+// ================================================================
+//  SEÇÃO 10: DETECÇÃO DE LINHA DE VISÃO (Raycast auxiliar)
+//
+//  Usa DDA simplificado para verificar se dois pontos no mapa
+//  podem se "ver" sem paredes entre eles.
+//  Usado na IA dos inimigos para detecção do jogador.
+// ================================================================
+
+function hasLineOfSight(x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < 0.01) return true;
+    const rdx = dx / dist, rdy = dy / dist;
+
+    let mapX = Math.floor(x1), mapY = Math.floor(y1);
+    const ddx = (rdx === 0) ? 1e30 : Math.abs(1 / rdx);
+    const ddy = (rdy === 0) ? 1e30 : Math.abs(1 / rdy);
+
+    let stepX, stepY, sdx, sdy;
+    if (rdx < 0) { stepX = -1; sdx = (x1 - mapX) * ddx; }
+    else         { stepX =  1; sdx = (mapX + 1 - x1) * ddx; }
+    if (rdy < 0) { stepY = -1; sdy = (y1 - mapY) * ddy; }
+    else         { stepY =  1; sdy = (mapY + 1 - y1) * ddy; }
+
+    const targetMX = Math.floor(x2), targetMY = Math.floor(y2);
+    for (let i = 0; i < 64; i++) {
+        if (sdx < sdy) { sdx += ddx; mapX += stepX; }
+        else           { sdy += ddy; mapY += stepY; }
+        if (mapX === targetMX && mapY === targetMY) return true;
+        if (mapX < 0 || mapX >= MAP_W || mapY < 0 || mapY >= MAP_H) return false;
+        if (worldMap[mapY][mapX] > 0) return false;
+    }
+    return false;
+}
+
+// ================================================================
+//  SEÇÃO 11: SISTEMA DE COMBATE — DISPARO DA ARMA
+//
+//  Ao atirar, lançamos um raio do centro da tela (direção do
+//  jogador) e verificamos se um inimigo está na trajetória
+//  antes de uma parede. Usa o mesmo DDA do motor gráfico.
+// ================================================================
+
+function fireWeapon() {
+    if (weapon.cooldown > 0 || !player.alive) return;
+
+    weapon.cooldown  = weapon.fireRate;
+    weapon.firing    = true;
+    weapon.fireTimer = weapon.fireAnimDuration;
+    playGunshot();
+
+    // Raio central (mira) na direção do jogador
+    const rdx = player.dirX, rdy = player.dirY;
+    let mapX = Math.floor(player.x), mapY = Math.floor(player.y);
+
+    const ddx = (rdx === 0) ? 1e30 : Math.abs(1 / rdx);
+    const ddy = (rdy === 0) ? 1e30 : Math.abs(1 / rdy);
+    let stepX, stepY, sdx, sdy;
+
+    if (rdx < 0) { stepX = -1; sdx = (player.x - mapX) * ddx; }
+    else         { stepX =  1; sdx = (mapX + 1 - player.x) * ddx; }
+    if (rdy < 0) { stepY = -1; sdy = (player.y - mapY) * ddy; }
+    else         { stepY =  1; sdy = (mapY + 1 - player.y) * ddy; }
+
+    // Encontrar distância até parede mais próxima
+    let wallDist = Infinity, side = 0;
+    for (let i = 0; i < 64; i++) {
+        if (sdx < sdy) { sdx += ddx; mapX += stepX; side = 0; }
+        else           { sdy += ddy; mapY += stepY; side = 1; }
+        if (mapX < 0 || mapX >= MAP_W || mapY < 0 || mapY >= MAP_H) break;
+        if (worldMap[mapY][mapX] > 0) {
+            wallDist = (side === 0)
+                ? (mapX - player.x + (1 - stepX) / 2) / rdx
+                : (mapY - player.y + (1 - stepY) / 2) / rdy;
+            break;
+        }
+    }
+
+    // Verificar inimigos atingidos (antes da parede)
+    let closestEnemy = null, closestDist = wallDist;
+
+    for (const e of enemies) {
+        if (!e.alive) continue;
+        const ex = e.x - player.x, ey = e.y - player.y;
+        // Projeção escalar no raio
+        const dot = ex * rdx + ey * rdy;
+        if (dot <= 0) continue; // Atrás do jogador
+        // Distância perpendicular do inimigo ao raio
+        const perp = Math.abs(ex * rdy - ey * rdx);
+        if (perp < 0.5 && dot < closestDist) {
+            closestDist = dot;
+            closestEnemy = e;
+        }
+    }
+
+    if (closestEnemy) {
+        closestEnemy.hp -= weapon.damage;
+        closestEnemy.hurtTimer = 0.15;
+        closestEnemy.state = 'chase'; // Alerta o inimigo
+
+        if (closestEnemy.hp <= 0) {
+            closestEnemy.alive = false;
+            closestEnemy.state = 'dead';
+            closestEnemy.deathTimer = 1.0;
+            player.kills++;
+            playDeath();
+        } else {
+            playHit();
+        }
+    }
+}
+
+// ================================================================
+//  SEÇÃO 12: ATUALIZAÇÃO DA LÓGICA DO JOGO (UPDATE)
+//
+//  Executada uma vez por frame, antes da renderização.
+//  Gerencia: rotação, movimento/colisão do jogador,
+//  cooldowns da arma, IA dos inimigos e combate.
+// ================================================================
+
+function updateGame(dt) {
+    if (!player.alive) return;
+
+    // --- Rotação do jogador via mouse ---
+    if (mouseMovementX !== 0) {
+        const angle = mouseMovementX * MOUSE_SENSITIVITY;
+        const cos = Math.cos(angle), sin = Math.sin(angle);
+
+        // Rotacionar vetor de direção
+        const od = player.dirX;
+        player.dirX = player.dirX * cos - player.dirY * sin;
+        player.dirY = od * sin + player.dirY * cos;
+
+        // Rotacionar plano da câmera (mantém ⊥ à direção)
+        const op = player.planeX;
+        player.planeX = player.planeX * cos - player.planeY * sin;
+        player.planeY = op * sin + player.planeY * cos;
+
+        mouseMovementX = 0;
+    }
+
+    // --- Movimento do jogador (WASD) ---
+    const spd = MOVE_SPEED * dt;
+    let mx = 0, my = 0;
+
+    if (keys['KeyW']) { mx += player.dirX * spd; my += player.dirY * spd; }
+    if (keys['KeyS']) { mx -= player.dirX * spd; my -= player.dirY * spd; }
+    // Strafe: perpendicular à direção
+    //   Direita = (-dirY, dirX);  Esquerda = (dirY, -dirX)
+    if (keys['KeyD']) { mx -= player.dirY * spd; my += player.dirX * spd; }
+    if (keys['KeyA']) { mx += player.dirY * spd; my -= player.dirX * spd; }
+
+    // Colisão com paredes — testamos X e Y separadamente
+    // para permitir "deslizar" ao longo da parede
+    const cr = COLLISION_RADIUS;
+    if (mx !== 0) {
+        const nx = player.x + mx;
+        const cx = nx + (mx > 0 ? cr : -cr);
+        if (worldMap[Math.floor(player.y)][Math.floor(cx)] === 0 &&
+            worldMap[Math.floor(player.y + cr)][Math.floor(cx)] === 0 &&
+            worldMap[Math.floor(player.y - cr)][Math.floor(cx)] === 0) {
+            player.x = nx;
+        }
+    }
+    if (my !== 0) {
+        const ny = player.y + my;
+        const cy = ny + (my > 0 ? cr : -cr);
+        if (worldMap[Math.floor(cy)][Math.floor(player.x)] === 0 &&
+            worldMap[Math.floor(cy)][Math.floor(player.x + cr)] === 0 &&
+            worldMap[Math.floor(cy)][Math.floor(player.x - cr)] === 0) {
+            player.y = ny;
+        }
+    }
+
+    // --- Timers da arma ---
+    if (weapon.cooldown > 0) weapon.cooldown -= dt;
+    if (weapon.fireTimer > 0) {
+        weapon.fireTimer -= dt;
+        if (weapon.fireTimer <= 0) weapon.firing = false;
+    }
+
+    // --- Timer de dano do jogador ---
+    if (player.hurtTimer > 0) player.hurtTimer -= dt;
+
+    // --- IA dos inimigos ---
+    updateEnemies(dt);
+}
+
+// --- Atualização dos inimigos (separada para organização) ---
+function updateEnemies(dt) {
+    for (const e of enemies) {
+        if (e.state === 'dead') {
+            if (e.deathTimer > 0) e.deathTimer -= dt;
+            continue;
+        }
+        if (!e.alive) continue;
+        if (e.hurtTimer > 0) e.hurtTimer -= dt;
+
+        const dx = player.x - e.x, dy = player.y - e.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        // Detecção: alcance + linha de visão
+        if (e.state === 'idle' && dist < e.detectionRange) {
+            if (hasLineOfSight(e.x, e.y, player.x, player.y)) {
+                e.state = 'chase';
+            }
+        }
+
+        if (e.state === 'chase') {
+            if (dist < e.attackRange) {
+                e.state = 'attack';
+                e.attackCooldown = 0.3; // Pequeno delay antes do 1º ataque
+            } else {
+                // Mover em direção ao jogador
+                const inv = e.speed * dt / dist;
+                const emx = dx * inv, emy = dy * inv;
+                // Colisão inimigo→parede
+                if (worldMap[Math.floor(e.y)][Math.floor(e.x + emx)] === 0) e.x += emx;
+                if (worldMap[Math.floor(e.y + emy)][Math.floor(e.x)] === 0) e.y += emy;
+            }
+        }
+
+        if (e.state === 'attack') {
+            if (dist > e.attackRange * 2) {
+                e.state = 'chase';
+            } else {
+                e.attackCooldown -= dt;
+                if (e.attackCooldown <= 0) {
+                    e.attackCooldown = e.attackInterval;
+                    // Causar dano ao jogador (somente com linha de visão)
+                    if (hasLineOfSight(e.x, e.y, player.x, player.y)) {
+                        player.hp -= e.damage;
+                        player.hurtTimer = 0.25;
+                        playPlayerHurt();
+                        if (player.hp <= 0) {
+                            player.hp = 0;
+                            player.alive = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Separação entre inimigos (evita empilhamento)
+    for (let i = 0; i < enemies.length; i++) {
+        if (!enemies[i].alive) continue;
+        for (let j = i + 1; j < enemies.length; j++) {
+            if (!enemies[j].alive) continue;
+            const dx = enemies[j].x - enemies[i].x;
+            const dy = enemies[j].y - enemies[i].y;
+            const d  = Math.sqrt(dx * dx + dy * dy);
+            if (d < 0.7 && d > 0.001) {
+                const push = (0.7 - d) * 0.5;
+                const nx = dx / d, ny = dy / d;
+                enemies[i].x -= nx * push;
+                enemies[i].y -= ny * push;
+                enemies[j].x += nx * push;
+                enemies[j].y += ny * push;
+            }
+        }
+    }
+}
+
+// ================================================================
+//  SEÇÃO 13: MOTOR DE RAYCASTING — RENDERIZAÇÃO 3D
+//
+//  MATEMÁTICA DO RAYCASTING (DDA):
+//
+//  Para cada coluna X da tela (0..SCREEN_W-1):
+//
+//  1) Calcular coordenada da câmera:
+//       cameraX = 2 * x / SCREEN_W - 1     (varia de -1 a +1)
+//
+//  2) Calcular direção do raio:
+//       rayDir = playerDir + playerPlane * cameraX
+//     O plano da câmera é perpendicular à direção, e seu
+//     comprimento define o FOV (tan(FOV/2)).
+//
+//  3) Usando DDA (Digital Differential Analysis):
+//     - deltaDistX = |1 / rayDirX| = comprimento do raio para
+//       cruzar uma célula na direção X
+//     - deltaDistY = |1 / rayDirY| = idem para Y
+//     - A cada passo, avançamos para o lado mais próximo (X ou Y)
+//     - Paramos quando encontramos uma parede (worldMap > 0)
+//
+//  4) Distância perpendicular (evita efeito fisheye):
+//       Se atingiu parede EW (side=0):
+//         perpDist = (mapX - posX + (1-stepX)/2) / rayDirX
+//       Se atingiu parede NS (side=1):
+//         perpDist = (mapY - posY + (1-stepY)/2) / rayDirY
+//
+//     Esta é a distância do ponto de impacto ao PLANO da câmera,
+//     não a distância euclidiana ao jogador.
+//     Demonstração: rayDir = dir + plane*cx,  dir·plane = 0
+//     Logo dir·rayDir = |dir|² = 1, e perpDist = t*(dir·rayDir) = t
+//
+//  5) Altura da parede na tela:
+//       lineHeight = SCREEN_H / perpDist
+//
+//  6) Mapeamento de textura:
+//     - wallX: ponto exato de impacto (fração da célula)
+//     - texX = wallX * TEX_SIZE
+//     - texY mapeado proporcionalmente à lineHeight
+//
+//  7) Iluminação: brightness = min(1, k / perpDist)
+//     Paredes NS recebem 70% do brilho (efeito de profundidade)
+// ================================================================
+
+// Buffer de profundidade (z-buffer): um valor por coluna da tela
+const zBuffer = new Float64Array(SCREEN_W);
+
+// ImageData para manipulação direta de pixels (muito mais rápido
+// que múltiplas chamadas a drawImage/fillRect)
+const imageData = ctx.createImageData(SCREEN_W, SCREEN_H);
+const buf       = imageData.data; // Uint8ClampedArray [R,G,B,A, R,G,B,A, ...]
+
+function renderScene() {
+    // ---- Preencher teto (gradiente escuro azulado) e chão (gradiente marrom) ----
+    const halfH = SCREEN_H >> 1;
+    for (let y = 0; y < SCREEN_H; y++) {
+        // Pre-computar base do índice da linha
+        const rowBase = y * SCREEN_W;
+        if (y < halfH) {
+            // Teto: mais escuro no horizonte, mais claro no topo
+            const t = y / halfH; // 0 (topo) → 1 (horizonte)
+            const shade = 10 + (1 - t) * 25;
+            const cr = shade * 0.3, cg = shade * 0.3, cb = shade * 0.6;
+            for (let x = 0; x < SCREEN_W; x++) {
+                const i = (rowBase + x) << 2;
+                buf[i] = cr; buf[i|1] = cg; buf[i|2] = cb; buf[i|3] = 255;
+            }
+        } else {
+            // Chão: mais escuro no horizonte, mais claro embaixo
+            const t = (y - halfH) / halfH; // 0 (horizonte) → 1 (fundo)
+            const shade = 8 + t * 45;
+            const cr = shade * 0.5, cg = shade * 0.35, cb = shade * 0.15;
+            for (let x = 0; x < SCREEN_W; x++) {
+                const i = (rowBase + x) << 2;
+                buf[i] = cr; buf[i|1] = cg; buf[i|2] = cb; buf[i|3] = 255;
+            }
+        }
+    }
+
+    // ---- Raycasting: uma iteração por coluna da tela ----
+    for (let x = 0; x < SCREEN_W; x++) {
+        // [Passo 1] Coordenada X no espaço da câmera: -1 (esquerda) → +1 (direita)
+        const cameraX = 2 * x / SCREEN_W - 1;
+
+        // [Passo 2] Direção do raio
+        const rayDirX = player.dirX + player.planeX * cameraX;
+        const rayDirY = player.dirY + player.planeY * cameraX;
+
+        // Posição na grade do mapa
+        let mapX = Math.floor(player.x);
+        let mapY = Math.floor(player.y);
+
+        // [Passo 3] Delta distances (evitar divisão por zero com 1e30)
+        const deltaDistX = (rayDirX === 0) ? 1e30 : Math.abs(1 / rayDirX);
+        const deltaDistY = (rayDirY === 0) ? 1e30 : Math.abs(1 / rayDirY);
+
+        // Direção do passo e distância inicial ao primeiro lado da grade
+        let stepX, stepY, sideDistX, sideDistY;
+        if (rayDirX < 0) {
+            stepX = -1;
+            sideDistX = (player.x - mapX) * deltaDistX;
+        } else {
+            stepX = 1;
+            sideDistX = (mapX + 1.0 - player.x) * deltaDistX;
+        }
+        if (rayDirY < 0) {
+            stepY = -1;
+            sideDistY = (player.y - mapY) * deltaDistY;
+        } else {
+            stepY = 1;
+            sideDistY = (mapY + 1.0 - player.y) * deltaDistY;
+        }
+
+        // [Passo 3 cont.] Algoritmo DDA: avançar pela grade até atingir parede
+        let hit  = false;
+        let side = 0; // 0 = parede EW (vertical no mapa), 1 = parede NS (horizontal)
+
+        for (let i = 0; i < 64; i++) { // Max 64 passos (segurança)
+            if (sideDistX < sideDistY) {
+                sideDistX += deltaDistX;
+                mapX += stepX;
+                side = 0;
+            } else {
+                sideDistY += deltaDistY;
+                mapY += stepY;
+                side = 1;
+            }
+            if (mapX < 0 || mapX >= MAP_W || mapY < 0 || mapY >= MAP_H) break;
+            if (worldMap[mapY][mapX] > 0) { hit = true; break; }
+        }
+
+        if (!hit) { zBuffer[x] = 1e30; continue; }
+
+        // [Passo 4] Distância perpendicular ao plano da câmera
+        const perpWallDist = (side === 0)
+            ? (mapX - player.x + (1 - stepX) * 0.5) / rayDirX
+            : (mapY - player.y + (1 - stepY) * 0.5) / rayDirY;
+
+        zBuffer[x] = perpWallDist; // Para renderização de sprites
+
+        // [Passo 5] Altura da coluna de parede na tela
+        const lineHeight = Math.floor(SCREEN_H / perpWallDist);
+        let drawStart = (halfH - (lineHeight >> 1)) | 0;
+        let drawEnd   = (halfH + (lineHeight >> 1)) | 0;
+        if (drawStart < 0)         drawStart = 0;
+        if (drawEnd >= SCREEN_H)   drawEnd = SCREEN_H - 1;
+
+        // [Passo 6] Mapeamento de textura
+        // wallX: exatamente onde o raio atingiu a face da parede (0.0 → 1.0)
+        let wallX;
+        if (side === 0) wallX = player.y + perpWallDist * rayDirY;
+        else            wallX = player.x + perpWallDist * rayDirX;
+        wallX -= Math.floor(wallX);
+
+        // Coordenada X na textura
+        let texX = (wallX * TEX_SIZE) | 0;
+        if (side === 0 && rayDirX > 0) texX = TEX_SIZE - texX - 1;
+        if (side === 1 && rayDirY < 0) texX = TEX_SIZE - texX - 1;
+
+        // Textura correspondente ao tipo de parede
+        const texIdx = worldMap[mapY][mapX] - 1;
+        const tex = textures[texIdx] || textures[0];
+
+        // Incremento da coordenada Y da textura por pixel da tela
+        const texStep = TEX_SIZE / lineHeight;
+        let texPos = (drawStart - halfH + (lineHeight >> 1)) * texStep;
+
+        // [Passo 7] Iluminação baseada em distância
+        let brightness = Math.min(1.0, 1.5 / perpWallDist);
+        if (side === 1) brightness *= 0.7; // Paredes NS mais escuras
+
+        // ---- Desenhar coluna de pixels ----
+        for (let y = drawStart; y <= drawEnd; y++) {
+            const texY = texPos & (TEX_SIZE - 1); // Equivalente a % TEX_SIZE (para potência de 2)
+            texPos += texStep;
+
+            const color = tex[texY * TEX_SIZE + texX];
+            const i = (y * SCREEN_W + x) << 2;
+            buf[i]     = ((color >> 16) & 0xFF) * brightness;
+            buf[i | 1] = ((color >> 8)  & 0xFF) * brightness;
+            buf[i | 2] = ( color        & 0xFF) * brightness;
+            // buf[i|3] já é 255 do preenchimento de teto/chão
+        }
+    }
+
+    // ---- Renderizar sprites (inimigos) sobre as paredes ----
+    renderSprites();
+
+    // ---- Enviar buffer de pixels para o canvas ----
+    ctx.putImageData(imageData, 0, 0);
+
+    // ---- Elementos sobrepostos (Canvas 2D API) ----
+    renderWeapon();
+    renderHUD();
+    renderMinimap();
+
+    // Flash vermelho quando o jogador toma dano
+    if (player.hurtTimer > 0) {
+        ctx.globalAlpha = Math.min(1, player.hurtTimer * 3);
+        ctx.fillStyle = '#FF0000';
+        ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+        ctx.globalAlpha = 1;
+    }
+
+    // Tela de morte
+    if (!player.alive) renderDeathScreen();
+}
+
+// ================================================================
+//  SEÇÃO 14: RENDERIZAÇÃO DE SPRITES (Inimigos em pseudo-3D)
+//
+//  Sprites são imagens 2D posicionadas no mundo 3D.
+//
+//  MATEMÁTICA:
+//  1) Posição relativa ao jogador: sprite - player
+//  2) Transformar para espaço da câmera usando a INVERSA
+//     da matriz da câmera [planeX, dirX; planeY, dirY]:
+//       invDet = 1 / (planeX*dirY - dirX*planeY)
+//       transformX = invDet * (dirY*sprX - dirX*sprY)
+//       transformY = invDet * (-planeY*sprX + planeX*sprY)
+//     transformX = posição horizontal na tela
+//     transformY = profundidade (distância ao plano da câmera)
+//
+//  3) Posição na tela: screenX = (SCREEN_W/2) * (1 + transformX/transformY)
+//  4) Tamanho na tela: proporcional a SCREEN_H / transformY
+//  5) Desenhar pixel a pixel, verificando z-buffer por coluna
+// ================================================================
+
+function renderSprites() {
+    // Construir lista de sprites com distância ao jogador
+    const list = [];
+    for (const e of enemies) {
+        // Mostrar inimigos vivos, morrendo (animação) e mortos (cadáver)
+        const dx = e.x - player.x, dy = e.y - player.y;
+        const dist2 = dx * dx + dy * dy;
+
+        let spr;
+        if (e.state === 'dead' && e.deathTimer <= 0) {
+            spr = spriteDead;
+        } else if (!e.alive) {
+            spr = spriteHurt; // Flash durante morte
+        } else {
+            spr = (e.hurtTimer > 0) ? spriteHurt : spriteAlive;
+        }
+        list.push({ x: e.x, y: e.y, dist2, spr });
+    }
+
+    // Ordenar: mais distante primeiro (painter's algorithm)
+    list.sort((a, b) => b.dist2 - a.dist2);
+
+    // Inversa da matriz da câmera
+    const invDet = 1.0 / (player.planeX * player.dirY - player.dirX * player.planeY);
+
+    for (const s of list) {
+        const sx = s.x - player.x, sy = s.y - player.y;
+
+        // Transformar para coordenadas da câmera
+        const tx = invDet * (player.dirY * sx - player.dirX * sy);
+        const ty = invDet * (-player.planeY * sx + player.planeX * sy);
+
+        if (ty <= 0.1) continue; // Atrás da câmera
+
+        // Posição e tamanho na tela
+        const screenX    = ((SCREEN_W >> 1) * (1 + tx / ty)) | 0;
+        const sprHeight  = Math.abs((SCREEN_H / ty) | 0);
+        const sprWidth   = sprHeight; // Quadrado
+
+        const startY = Math.max(0, (SCREEN_H >> 1) - (sprHeight >> 1));
+        const endY   = Math.min(SCREEN_H - 1, (SCREEN_H >> 1) + (sprHeight >> 1));
+        const startX = Math.max(0, screenX - (sprWidth >> 1));
+        const endX   = Math.min(SCREEN_W - 1, screenX + (sprWidth >> 1));
+
+        const sprOriginX = screenX - (sprWidth >> 1);
+        const sprOriginY = (SCREEN_H >> 1) - (sprHeight >> 1);
+
+        // Brilho baseado na distância
+        const bright = Math.min(1.0, 2.0 / ty);
+
+        // Desenhar coluna por coluna, respeitando z-buffer
+        for (let x = startX; x <= endX; x++) {
+            if (ty >= zBuffer[x]) continue; // Parede está mais perto
+
+            const texXi = ((x - sprOriginX) * SPRITE_SIZE / sprWidth) | 0;
+            if (texXi < 0 || texXi >= SPRITE_SIZE) continue;
+
+            for (let y = startY; y <= endY; y++) {
+                const texYi = ((y - sprOriginY) * SPRITE_SIZE / sprHeight) | 0;
+                if (texYi < 0 || texYi >= SPRITE_SIZE) continue;
+
+                const color = s.spr[texYi * SPRITE_SIZE + texXi];
+                if (color === 0) continue; // Transparente
+
+                const i = (y * SCREEN_W + x) << 2;
+                buf[i]     = ((color >> 16) & 0xFF) * bright;
+                buf[i | 1] = ((color >> 8)  & 0xFF) * bright;
+                buf[i | 2] = ( color        & 0xFF) * bright;
+            }
+        }
+    }
+}
+
+// ================================================================
+//  SEÇÃO 15: RENDERIZAÇÃO DA ARMA
+//
+//  Arma desenhada na parte inferior-central como overlay.
+//  Animações: recuo ao atirar, balanço ao caminhar.
+// ================================================================
+
+function renderWeapon() {
+    const cx = SCREEN_W >> 1;
+    const by = SCREEN_H;
+    const isWalking = keys['KeyW'] || keys['KeyS'] || keys['KeyA'] || keys['KeyD'];
+    const bob = isWalking ? Math.sin(performance.now() * 0.008) * 2 : 0;
+    const recoilY = weapon.firing ? -10 : 0;
+    const recoilX = weapon.firing ? (Math.random() * 4 - 2) | 0 : 0;
+
+    const ox = cx + recoilX;
+    const oy = by + recoilY + bob;
+
+    // Cano
+    ctx.fillStyle = '#555';
+    ctx.fillRect(ox - 3, oy - 55, 6, 28);
+
+    // Boca do cano
+    ctx.fillStyle = '#444';
+    ctx.fillRect(ox - 5, oy - 57, 10, 4);
+
+    // Corpo/receiver
+    ctx.fillStyle = '#4a4a4a';
+    ctx.fillRect(ox - 10, oy - 30, 20, 16);
+
+    // Empunhadura
+    ctx.fillStyle = '#5c3a1e';
+    ctx.fillRect(ox - 7, oy - 16, 14, 18);
+
+    // Guarda do gatilho
+    ctx.fillStyle = '#333';
+    ctx.fillRect(ox - 1, oy - 20, 3, 8);
+
+    // Flash do disparo
+    if (weapon.firing) {
+        ctx.fillStyle = '#FFFF44';
+        ctx.beginPath();
+        ctx.arc(ox, oy - 59, 9, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#FFFFFF';
+        ctx.beginPath();
+        ctx.arc(ox, oy - 59, 4, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Mira (crosshair)
+    ctx.fillStyle = '#0F0';
+    ctx.globalAlpha = 0.8;
+    const chx = SCREEN_W >> 1, chy = SCREEN_H >> 1;
+    ctx.fillRect(chx - 1, chy - 5, 2, 4);  // Cima
+    ctx.fillRect(chx - 1, chy + 2, 2, 4);  // Baixo
+    ctx.fillRect(chx - 5, chy - 1, 4, 2);  // Esquerda
+    ctx.fillRect(chx + 2, chy - 1, 4, 2);  // Direita
+    ctx.globalAlpha = 1;
+}
+
+// ================================================================
+//  SEÇÃO 16: HUD (Heads-Up Display)
+//
+//  Exibe: barra de vida, kills, contagem de inimigos, FPS
+// ================================================================
+
+let fpsFrames = 0;
+let fpsTime   = 0;
+let fpsValue  = 0;
+
+function renderHUD() {
+    ctx.save();
+    // --- Barra de vida ---
+    const barW = 64, barH = 6;
+    const barX = 4, barY = SCREEN_H - 10;
+    ctx.fillStyle = '#330000';
+    ctx.fillRect(barX, barY, barW, barH);
+    const ratio = Math.max(0, player.hp / player.maxHp);
+    ctx.fillStyle = ratio > 0.5 ? '#0c0' : ratio > 0.25 ? '#cc0' : '#c00';
+    ctx.fillRect(barX, barY, barW * ratio, barH);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 0.5;
+    ctx.strokeRect(barX, barY, barW, barH);
+
+    ctx.font = '7px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('HP ' + player.hp, barX, barY - 2);
+
+    // --- Inimigos vivos / total ---
+    const alive = enemies.filter(e => e.alive).length;
+    ctx.fillStyle = '#f44';
+    ctx.fillText('KILLS ' + player.kills + '/' + enemies.length, barX, barY - 12);
+
+    // --- FPS ---
+    ctx.fillStyle = '#ff0';
+    ctx.textAlign = 'right';
+    ctx.fillText('FPS ' + fpsValue, SCREEN_W - 4, 8);
+
+    // --- Mensagem de vitória ---
+    if (alive === 0 && player.alive) {
+        ctx.fillStyle = '#0f0';
+        ctx.font = 'bold 10px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('TODOS ELIMINADOS!', SCREEN_W >> 1, 20);
+    }
+    ctx.restore();
+}
+
+// ================================================================
+//  SEÇÃO 17: MINIMAPA 2D
+//
+//  Mostra visão aérea do mapa em escala reduzida no canto
+//  superior esquerdo, com posição do jogador e inimigos.
+// ================================================================
+
+function renderMinimap() {
+    const s  = 3;  // Escala: 3px por célula
+    const mw = MAP_W * s, mh = MAP_H * s;
+    const mx = SCREEN_W - mw - 4;
+    const my = SCREEN_H - mh - 12;
+
+    ctx.save();
+    ctx.globalAlpha = 0.6;
+
+    // Fundo
+    ctx.fillStyle = '#000';
+    ctx.fillRect(mx - 1, my - 1, mw + 2, mh + 2);
+
+    // Desenhar grade do mapa
+    const wallColors = ['#843', '#888', '#468', '#864'];
+    for (let y = 0; y < MAP_H; y++) {
+        for (let x = 0; x < MAP_W; x++) {
+            const cell = worldMap[y][x];
+            ctx.fillStyle = cell > 0 ? (wallColors[cell - 1] || '#fff') : '#1a1a1a';
+            ctx.fillRect(mx + x * s, my + y * s, s, s);
+        }
+    }
+
+    ctx.globalAlpha = 0.9;
+
+    // Inimigos (pontos vermelhos)
+    ctx.fillStyle = '#f00';
+    for (const e of enemies) {
+        if (e.alive) ctx.fillRect(mx + e.x * s - 1, my + e.y * s - 1, 2, 2);
+    }
+
+    // Jogador (ponto verde)
+    ctx.fillStyle = '#0f0';
+    ctx.fillRect(mx + player.x * s - 1, my + player.y * s - 1, 3, 3);
+
+    // Direção do jogador (linha verde)
+    ctx.strokeStyle = '#0f0';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(mx + player.x * s, my + player.y * s);
+    ctx.lineTo(mx + (player.x + player.dirX * 2) * s, my + (player.y + player.dirY * 2) * s);
+    ctx.stroke();
+
+    ctx.restore();
+}
+
+// ================================================================
+//  SEÇÃO 18: TELA DE MORTE
+// ================================================================
+
+function renderDeathScreen() {
+    ctx.fillStyle = 'rgba(120, 0, 0, 0.55)';
+    ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+    ctx.fillStyle = '#FF0000';
+    ctx.font = 'bold 18px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('VOCE MORREU', SCREEN_W >> 1, SCREEN_H / 2 - 8);
+    ctx.fillStyle = '#fff';
+    ctx.font = '8px monospace';
+    ctx.fillText('Pressione R para reiniciar', SCREEN_W >> 1, SCREEN_H / 2 + 12);
+    ctx.fillText('Kills: ' + player.kills + '/' + enemies.length, SCREEN_W >> 1, SCREEN_H / 2 + 24);
+}
+
+// ================================================================
+//  SEÇÃO 19: GAME LOOP PRINCIPAL
+//
+//  Usa requestAnimationFrame para sincronizar com o refresh
+//  da tela (geralmente 60fps). Delta time garante que a
+//  velocidade do jogo seja independente do frame rate.
+// ================================================================
+
+let lastTime = 0;
+
+function gameLoop(timestamp) {
+    // Delta time com cap em 100ms (para evitar saltos quando a aba perde foco)
+    const dt = Math.min((timestamp - lastTime) / 1000, 0.1);
+    lastTime = timestamp;
+
+    // Calcular FPS
+    fpsFrames++;
+    fpsTime += dt;
+    if (fpsTime >= 1.0) {
+        fpsValue  = fpsFrames;
+        fpsFrames = 0;
+        fpsTime  -= 1.0;
+    }
+
+    // Atualizar e renderizar
+    updateGame(dt);
+    renderScene();
+
+    requestAnimationFrame(gameLoop);
+}
+
+// ================================================================
+//  SEÇÃO 20: INICIALIZAÇÃO E REINÍCIO
+// ================================================================
+
+function restartGame() {
+    player.x = 2.0;  player.y = 2.0;
+    player.dirX = 1.0;  player.dirY = 0.0;
+    player.planeX = 0.0; player.planeY = PLANE_LENGTH;
+    player.hp = player.maxHp;
+    player.alive = true;
+    player.hurtTimer = 0;
+    player.kills = 0;
+    weapon.cooldown = 0;
+    weapon.firing = false;
+    weapon.fireTimer = 0;
+    spawnEnemies();
+}
+
+function init() {
+    generateTextures();
+    generateEnemySprites();
+    spawnEnemies();
+    requestAnimationFrame(gameLoop);
+}
+
+init();
+
+</script>
+</body>
+</html>
